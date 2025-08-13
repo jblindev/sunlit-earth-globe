@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sunlit Earth Globe — PWA</title>
+<meta name="theme-color" content="#0b1020" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="icon" href="icons/icon-192.png" sizes="192x192" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<style>
+  html, body { height:100%; margin:0; }
+  body { background:#0b1020; color:#e6eefc; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .topbar{ display:flex; gap:.75rem; align-items:center; padding:.75rem; border-bottom:1px solid #1f2a44; background:#0f162e; position:sticky; top:0; z-index:10 }
+  .spacer{ flex:1 }
+  label{ font-size:.9rem; opacity:.9 }
+  input, button{ background:#1b2747; color:#e6eefc; border:1px solid #26345e; border-radius:.5rem; padding:.45rem .6rem; }
+  input[type="checkbox"]{ width:1.1rem; height:1.1rem; vertical-align:middle }
+  button{ cursor:pointer }
+  #app{ position:fixed; inset:0; display:flex; flex-direction:column }
+  #viewport{ position:relative; flex:1; }
+  #canvas{ position:absolute; inset:0 }
+  .hint{ position:absolute; left:.5rem; bottom:.5rem; font-size:.8rem; opacity:.75; background:rgba(0,0,0,.35); padding:.25rem .5rem; border-radius:.4rem }
+  .loading{ position:absolute; inset:0; display:grid; place-items:center; color:#cbd5e1 }
+  .banner{ position:absolute; right:.5rem; bottom:2.2rem; background:#0c1738; border:1px dashed #3b4c7a; padding:.4rem .6rem; border-radius:.5rem; font-size:.8rem }
+  .gh { position:absolute; top:.75rem; right:.75rem; font-size:.8rem; opacity:.8 }
+  .gh a { color:#9dc1ff; text-decoration:none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <strong>Sunlit Earth Globe — PWA</strong>
+    <div class="spacer"></div>
+    <label>Date <input id="dateInput" type="date"/></label>
+    <label>Time <input id="timeInput" type="time" step="60"/></label>
+    <button id="nowBtn">Now</button>
+    <label><input id="autoChk" type="checkbox" checked> Auto‑rotate</label>
+    <button id="textureBtn" title="Embed a texture for offline use">Texture…</button>
+  </div>
+  <div id="viewport">
+    <div id="canvas"></div>
+    <div id="loading" class="loading">Loading…</div>
+    <div class="hint">Drag to rotate • Scroll/pinch to zoom • Double‑click to reset</div>
+    <div class="banner" id="banner" style="display:none">Tip: click <b>Texture…</b> to embed an offline map</div>
+  </div>
+  <div class="gh">Open‑source on GitHub Pages</div>
+</div>
+
+<!-- Three.js + controls from CDN (will be cached by the Service Worker on first load) -->
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ===== Solar position (approx) =====
+const deg2rad = d => d*Math.PI/180;
+function julianDay(date){ return date.getTime()/86400000 + 2440587.5; }
+function julianCenturies(jd){ return (jd - 2451545.0)/36525.0; }
+function sunVectorECEF(date){
+  const jd = julianDay(date); const T = julianCenturies(jd);
+  let L0 = 280.46646 + T*(36000.76983 + 0.0003032*T); L0 = ((L0%360)+360)%360;
+  const M = 357.52911 + T*(35999.05029 - 0.0001537*T);
+  const omega = 125.04 - 1934.136*T;
+  const C = (1.914602 - T*(0.004817 + 0.000014*T))*Math.sin(deg2rad(M))
+          + (0.019993 - 0.000101*T)*Math.sin(deg2rad(2*M))
+          + 0.000289*Math.sin(deg2rad(3*M));
+  const trueLong = L0 + C; // deg
+  const lambda = trueLong - 0.00569 - 0.00478*Math.sin(deg2rad(omega));
+  const U = T/100;
+  let eps0 = 23 + (26 + (21.448 - U*(46.815 + U*(0.00059 - U*0.001813)))/60)/60;
+  const eps = eps0 + 0.00256*Math.cos(deg2rad(omega));
+  const lam = deg2rad(lambda), eR = deg2rad(eps);
+  const alpha = Math.atan2(Math.cos(eR)*Math.sin(lam), Math.cos(lam));
+  const delta = Math.asin(Math.sin(eR)*Math.sin(lam));
+  const T0 = (jd - 2451545.0)/36525.0;
+  const GMST = deg2rad((280.46061837 + 360.98564736629*(jd - 2451545) + 0.000387933*T0*T0 - (T0*T0*T0)/38710000)%360);
+  let subLon = GMST - alpha; subLon = ((subLon + Math.PI)%(2*Math.PI)) - Math.PI;
+  const subLat = delta;
+  const x = Math.cos(subLat)*Math.cos(subLon);
+  const y = Math.cos(subLat)*Math.sin(subLon);
+  const z = Math.sin(subLat);
+  const v = new THREE.Vector3(x,y,z); v.normalize(); return v;
+}
+
+// ===== Scene =====
+const container = document.getElementById('canvas');
+const loading = document.getElementById('loading');
+const banner = document.getElementById('banner');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+container.appendChild(renderer.domElement);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.enablePan = false; controls.autoRotate = true; controls.autoRotateSpeed = 0.4;
+
+camera.position.set(0,0,3.2);
+scene.add(new THREE.AmbientLight(0xffffff, 0.2));
+
+// Stars
+(function(){
+  const starCount=2000; const geo=new THREE.BufferGeometry();
+  const pos=new Float32Array(starCount*3);
+  for(let i=0;i<starCount;i++){
+    const r=50+Math.random()*50; const t=Math.acos(2*Math.random()-1); const p=2*Math.PI*Math.random();
+    pos[i*3+0]=r*Math.sin(t)*Math.cos(p);
+    pos[i*3+1]=r*Math.sin(t)*Math.sin(p);
+    pos[i*3+2]=r*Math.cos(t);
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  const pts=new THREE.Points(geo, new THREE.PointsMaterial({size:0.005}));
+  scene.add(pts);
+})();
+
+// Shaded Earth
+const vertexShader = `
+  varying vec2 vUv; varying vec3 vNormal; 
+  void main(){ vUv=uv; vNormal = normalMatrix * normal; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+`;
+const fragmentShader = `
+  varying vec2 vUv; varying vec3 vNormal; uniform sampler2D uMap; uniform vec3 uSunDir; 
+  void main(){
+    vec3 N = normalize(vNormal);
+    float day = clamp(dot(N, normalize(uSunDir)), 0.0, 1.0);
+    vec4 tex = texture2D(uMap, vUv);
+    float twilight = smoothstep(0.0, 0.2, day);
+    vec3 color = tex.rgb * (0.2 + 0.8*day);
+    color += 0.10 * tex.rgb * (1.0 - twilight);
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+const uniforms = { uMap:{value:null}, uSunDir:{value:new THREE.Vector3(1,0,0)} };
+const globeMat = new THREE.ShaderMaterial({ vertexShader, fragmentShader, uniforms });
+const globe = new THREE.Mesh(new THREE.SphereGeometry(1,128,128), globeMat);
+scene.add(globe);
+
+const atmosphere = new THREE.Mesh(new THREE.SphereGeometry(1.02,64,64), new THREE.MeshBasicMaterial({color:0x5ea9ff, transparent:true, opacity:0.08, side:THREE.BackSide}));
+scene.add(atmosphere);
+
+// Placeholder 1x1 texture (until user embeds their own)
+const PLACEHOLDER = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAuMBgll3oKUAAAAASUVORK5CYII=';
+new THREE.TextureLoader().load(PLACEHOLDER, tex=>{ tex.colorSpace = THREE.SRGBColorSpace; uniforms.uMap.value = tex; loading.style.display='none'; banner.style.display='block'; });
+
+// Resize
+function resize(){
+  const rect = container.getBoundingClientRect();
+  const w = Math.max(320, rect.width || window.innerWidth);
+  const h = Math.max(240, (rect.height|| (window.innerHeight-64)));
+  renderer.setSize(w,h,false); camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+// UI controls
+const dateInput = document.getElementById('dateInput');
+const timeInput = document.getElementById('timeInput');
+const nowBtn = document.getElementById('nowBtn');
+const autoChk = document.getElementById('autoChk');
+const textureBtn = document.getElementById('textureBtn');
+
+function pad(n){ return String(n).padStart(2,'0'); }
+function setDateInputs(d){ dateInput.value = d.toISOString().slice(0,10); timeInput.value = `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+function parseInputs(){ const ds=dateInput.value, ts=timeInput.value||'00:00'; if(!ds) return null; const [y,m,da]=ds.split('-').map(n=>+n); const [hh,mm]=ts.split(':').map(n=>+n); if([y,m,da,hh,mm].some(isNaN)) return null; return new Date(y,m-1,da,hh,mm,0); }
+let activeDate = new Date(); setDateInputs(activeDate);
+
+dateInput.addEventListener('change', ()=>{ const d=parseInputs(); if(d) activeDate=d; });
+timeInput.addEventListener('change', ()=>{ const d=parseInputs(); if(d) activeDate=d; });
+nowBtn.addEventListener('click', ()=>{ const d=new Date(); setDateInputs(d); activeDate=d; });
+autoChk.addEventListener('change', ()=>{ controls.autoRotate = autoChk.checked; });
+
+// Embed a chosen texture to localStorage
+const KEY='EARTH_DATAURL_V1';
+textureBtn.addEventListener('click', ()=>{
+  const input=document.createElement('input'); input.type='file'; input.accept='image/*';
+  input.onchange = ()=>{
+    const f=input.files && input.files[0]; if(!f) return;
+    const reader=new FileReader(); reader.onload=e=>{
+      const dataUrl=e.target.result;
+      new THREE.TextureLoader().load(dataUrl, tex=>{
+        tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        uniforms.uMap.value = tex; try{ localStorage.setItem(KEY, dataUrl); }catch(err){ console.warn('Could not save texture to localStorage', err); }
+        banner.style.display='none';
+      }, undefined, err=>{ alert('Could not load that image. Try a JPG/PNG equirectangular (e.g., 2048×1024).'); console.error(err); });
+    };
+    reader.readAsDataURL(f);
+  };
+  input.click();
+});
+
+// Load stored texture if present
+(function(){
+  try{
+    const saved = localStorage.getItem(KEY);
+    if(saved){ new THREE.TextureLoader().load(saved, tex=>{ tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = renderer.capabilities.getMaxAnisotropy(); uniforms.uMap.value = tex; banner.style.display='none'; loading.style.display='none'; }); }
+  }catch{ /* ignore */ }
+})();
+
+// Animate
+function animate(){
+  uniforms.uSunDir.value.copy(sunVectorECEF(activeDate));
+  controls.update();
+  renderer.render(scene,camera);
+  requestAnimationFrame(animate);
+}
+animate();
+
+// Double‑click to reset view
+renderer.domElement.addEventListener('dblclick', ()=> controls.reset());
+
+// ===== Service worker registration =====
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./service-worker.js')
+      .catch(err => console.error('SW registration failed', err));
+  });
+}
+</script>
+</body>
+</html>
